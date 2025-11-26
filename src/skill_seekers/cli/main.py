@@ -97,6 +97,10 @@ For more information: https://github.com/yusufkaraaslan/Skill_Seekers
     github_parser.add_argument("--repo", help="GitHub repo (owner/repo)")
     github_parser.add_argument("--name", help="Skill name")
     github_parser.add_argument("--description", help="Skill description")
+    github_parser.add_argument("--github-local-path", help="Local Git repository path (offline GitHub mode)")
+    github_parser.add_argument("--github-repo-name", help="Override repository name when using a local path")
+    github_parser.add_argument("--include-untracked", action="store_true", help="Include untracked files for local Git analysis")
+    github_parser.add_argument("--show-absolute-path", action="store_true", help="Show absolute local paths in logs")
 
     # === pdf subcommand ===
     pdf_parser = subparsers.add_parser(
@@ -214,6 +218,14 @@ def main(argv: Optional[List[str]] = None) -> int:
                 sys.argv.extend(["--name", args.name])
             if args.description:
                 sys.argv.extend(["--description", args.description])
+            if args.github_local_path:
+                sys.argv.extend(["--github-local-path", args.github_local_path])
+            if args.github_repo_name:
+                sys.argv.extend(["--github-repo-name", args.github_repo_name])
+            if args.include_untracked:
+                sys.argv.append("--include-untracked")
+            if args.show_absolute_path:
+                sys.argv.append("--show-absolute-path")
             return github_main() or 0
 
         elif args.command == "pdf":

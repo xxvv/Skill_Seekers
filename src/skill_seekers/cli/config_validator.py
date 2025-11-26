@@ -178,6 +178,17 @@ class ConfigValidator:
         if 'max_issues' in source and not isinstance(source['max_issues'], int):
             raise ValueError(f"Source {index} (github): 'max_issues' must be an integer")
 
+        # Validate local Git overrides if present
+        local_path = source.get('github_local_path')
+        if local_path:
+            path_obj = Path(local_path)
+            if not path_obj.exists():
+                logger.warning(f"Source {index} (github): Local path not found: {local_path}")
+            elif not (path_obj / '.git').exists():
+                raise ValueError(
+                    f"Source {index} (github): github_local_path is not a Git repository: {local_path}"
+                )
+
     def _validate_pdf_source(self, source: Dict[str, Any], index: int):
         """Validate PDF source configuration."""
         if 'path' not in source:

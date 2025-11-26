@@ -190,6 +190,15 @@ class UnifiedScraper:
             'file_patterns': source.get('file_patterns', [])
         }
 
+        if source.get('github_local_path'):
+            github_config['github_local_path'] = source['github_local_path']
+        if source.get('github_repo_name'):
+            github_config['github_repo_name'] = source['github_repo_name']
+        if 'include_untracked' in source:
+            github_config['include_untracked'] = source['include_untracked']
+        if 'show_absolute_path' in source:
+            github_config['show_absolute_path'] = source['show_absolute_path']
+
         # Scrape
         logger.info(f"Scraping GitHub repository: {source['repo']}")
         scraper = GitHubScraper(github_config)

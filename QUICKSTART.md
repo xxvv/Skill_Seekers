@@ -80,6 +80,25 @@ skill-seekers unified --config configs/godot_unified.json
 
 ---
 
+## 🔒 Offline GitHub Mode
+
+Run the GitHub pipeline without touching the GitHub API by pointing to any local checkout:
+
+```bash
+skill-seekers github --github-local-path ~/code/service \
+    --github-repo-name my-company/service \
+    --include-untracked
+```
+
+- `--github-local-path` tells Skill Seeker to read the repo straight from disk and tag outputs with `source_type=local-github`.
+- `--github-repo-name` keeps reports consistent when your folder name differs from the upstream slug (optional).
+- `--include-untracked` includes files that haven't been committed yet; without it they are ignored and you'll see a warning.
+- `--show-absolute-path` prints the real path in logs if you need it—by default logs only show relative names to avoid leaks.
+
+The same options (`github_local_path`, `github_repo_name`, `include_untracked`, `show_absolute_path`) work inside config files and unified sources, so MCP users can run everything in air-gapped environments.
+
+---
+
 ## ⚡ Using Existing Data (Fast!)
 
 If you already scraped once:

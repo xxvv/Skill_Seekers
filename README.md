@@ -232,7 +232,19 @@ skill-seekers github --repo django/django \
     --max-issues 100 \        # Limit issue count
     --include-changelog \     # Extract CHANGELOG.md
     --include-releases        # Extract GitHub Releases
+
+# Offline/local snapshots (no GitHub API required)
+skill-seekers github --github-local-path /work/repos/internal-service \
+    --github-repo-name my-company/internal-service \
+    --include-untracked
 ```
+
+- `--github-local-path` points Skill Seeker at a local Git checkout so you can reuse the GitHub analysis pipeline (conflict detection, packaging, references) without any network access. Outputs are tagged with `source_type=local-github`.
+- `--github-repo-name` overrides the repo label when your folder name doesn't match the upstream slug. (Optional but useful for reports.)
+- `--include-untracked` opts in to scanning untracked files—otherwise the tool warns and ignores them to keep results reproducible. Modified tracked files are always read from your current working tree snapshot.
+- `--show-absolute-path` reveals absolute paths in logs for debugging. By default only relative names are shown to avoid leaking internal infrastructure details.
+
+Unified configs and MCP deployments accept the same fields (`github_local_path`, `github_repo_name`, `include_untracked`, `show_absolute_path`) so you can run the entire GitHub pipeline inside an air-gapped network.
 
 **Time:** ~5-10 minutes | **Quality:** Production-ready | **Cost:** Free
 

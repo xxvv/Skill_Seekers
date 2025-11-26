@@ -20,9 +20,16 @@ import json
 import re
 import argparse
 import logging
+import subprocess
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 from datetime import datetime
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 try:
     from github import Github, GithubException, Repository
@@ -33,18 +40,47 @@ except ImportError:
 
 # Import code analyzer for deep code analysis
 try:
-    from code_analyzer import CodeAnalyzer
+    from .code_analyzer import CodeAnalyzer
     CODE_ANALYZER_AVAILABLE = True
 except ImportError:
-    CODE_ANALYZER_AVAILABLE = False
-    logger.warning("Code analyzer not available - deep analysis disabled")
+    try:
+        from code_analyzer import CodeAnalyzer  # Backwards compatibility when running as script
+        CODE_ANALYZER_AVAILABLE = True
+    except ImportError:
+        CODE_ANALYZER_AVAILABLE = False
+        logger.warning("Code analyzer not available - deep analysis disabled")
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+
+LOCAL_LANGUAGE_EXTENSIONS = {
+    '.py': 'Python',
+    '.js': 'JavaScript',
+    '.jsx': 'JavaScript',
+    '.ts': 'TypeScript',
+    '.tsx': 'TypeScript',
+    '.java': 'Java',
+    '.c': 'C',
+    '.h': 'C',
+    '.cpp': 'C++',
+    '.cc': 'C++',
+    '.hh': 'C++',
+    '.hpp': 'C++',
+    '.cxx': 'C++',
+    '.go': 'Go',
+    '.rs': 'Rust',
+    '.rb': 'Ruby',
+    '.php': 'PHP',
+    '.swift': 'Swift',
+    '.kt': 'Kotlin',
+    '.m': 'Objective-C',
+    '.mm': 'Objective-C++',
+    '.cs': 'C#'
+}
+
+
+class LocalGitError(Exception):
+    """Raised when an operation on the local Git repository fails."""
+
+    pass
 
 
 class GitHubScraper:
@@ -66,13 +102,34 @@ class GitHubScraper:
     def __init__(self, config: Dict[str, Any]):
         """Initialize GitHub scraper with configuration."""
         self.config = config
-        self.repo_name = config['repo']
+        self.local_repo_path = config.get('github_local_path')
+        self.include_untracked = config.get('include_untracked', False)
+        self.show_absolute_path = config.get('show_absolute_path', False)
+
+        repo_override = config.get('repo') or config.get('github_repo_name')
+        if not repo_override and self.local_repo_path:
+            repo_override = Path(self.local_repo_path).expanduser().resolve().name
+        if not repo_override:
+            raise ValueError("Config must include 'repo' or --github-local-path")
+
+        self.repo_name = repo_override
         self.name = config.get('name', self.repo_name.split('/')[-1])
         self.description = config.get('description', f'Skill for {self.repo_name}')
+        self.source_type = 'local-github' if self.local_repo_path else 'github'
+
+        # Local repository state
+        self.local_repo_root: Optional[Path] = None
+        self._local_files_cache: Optional[List[Dict[str, Any]]] = None
+        self._local_repo_display: Optional[str] = None
 
         # GitHub client setup (C1.1)
-        token = self._get_token()
-        self.github = Github(token) if token else Github()
+        self.github = None
+        if self.local_repo_path:
+            self.local_repo_root = Path(self.local_repo_path).expanduser().resolve()
+            self._local_repo_display = self._format_local_path(self.local_repo_root)
+        else:
+            token = self._get_token()
+            self.github = Github(token) if token else Github()
         self.repo: Optional[Repository.Repository] = None
 
         # Options
@@ -104,7 +161,9 @@ class GitHubScraper:
             'test_examples': [],
             'issues': [],
             'changelog': '',
-            'releases': []
+            'releases': [],
+            'source_type': self.source_type,
+            'source_metadata': {}
         }
 
     def _get_token(self) -> Optional[str]:
@@ -125,6 +184,225 @@ class GitHubScraper:
             return token
 
         logger.warning("No GitHub token provided - using unauthenticated access (lower rate limits)")
+        return None
+
+    # ===== Local repository helpers =====
+
+    def _is_local_mode(self) -> bool:
+        return self.local_repo_root is not None
+
+    def _format_local_path(self, path: Path) -> str:
+        if self.show_absolute_path:
+            return str(path)
+
+        cwd = Path.cwd()
+        try:
+            relative = path.relative_to(cwd)
+            return str(relative)
+        except ValueError:
+            return path.name or str(path)
+
+    def _run_git_command(self, args: List[str], strip: bool = True) -> str:
+        if not self._is_local_mode():
+            raise LocalGitError("Git commands are only available in local mode")
+
+        cmd = ["git", "-C", str(self.local_repo_root), *args]
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=False
+            )
+        except FileNotFoundError as exc:
+            raise LocalGitError("git command not found. Install Git to use local mode") from exc
+
+        if result.returncode != 0:
+            stderr = result.stderr.strip() or result.stdout.strip()
+            raise LocalGitError(stderr or "git command failed")
+
+        return result.stdout.strip() if strip else result.stdout
+
+    def _resolve_local_path(self, relative_path: str) -> Optional[Path]:
+        if not self._is_local_mode():
+            return None
+
+        target = relative_path.strip().lstrip('/')
+        if not target:
+            return self.local_repo_root
+
+        target_path = Path(target)
+        if any(part == '..' for part in target_path.parts):
+            return None
+
+        current = self.local_repo_root
+        for part in target_path.parts:
+            candidate = current / part
+            if candidate.exists():
+                current = candidate
+                continue
+
+            lowered = part.lower()
+            match = None
+            for child in current.iterdir():
+                if child.name.lower() == lowered:
+                    match = child
+                    break
+
+            if not match:
+                return None
+            current = match
+
+        return current
+
+    def _read_local_file(self, relative_path: str) -> Optional[str]:
+        resolved = self._resolve_local_path(relative_path)
+        if not resolved or not resolved.is_file():
+            return None
+
+        try:
+            return resolved.read_text(encoding='utf-8')
+        except UnicodeDecodeError:
+            return resolved.read_text(encoding='utf-8', errors='ignore')
+
+    def _collect_local_files(self) -> List[Dict[str, Any]]:
+        if self._local_files_cache is not None:
+            return self._local_files_cache
+
+        files: List[Dict[str, Any]] = []
+
+        def _add_files(output: str, tracked: bool):
+            for rel_path in output.split('\0'):
+                if not rel_path:
+                    continue
+                rel_path = rel_path.replace('\\', '/').strip()
+                abs_path = (self.local_repo_root / rel_path).resolve()
+                if abs_path.is_file():
+                    files.append({
+                        'path': rel_path,
+                        'abs_path': abs_path,
+                        'tracked': tracked,
+                        'size': abs_path.stat().st_size
+                    })
+
+        tracked_output = self._run_git_command(["ls-files", "-z"], strip=False)
+        _add_files(tracked_output, tracked=True)
+
+        if self.include_untracked:
+            untracked_output = self._run_git_command([
+                "ls-files", "--others", "--exclude-standard", "-z"
+            ], strip=False)
+            _add_files(untracked_output, tracked=False)
+
+        self._local_files_cache = files
+        return files
+
+    def _build_local_file_tree(self) -> List[Dict[str, Any]]:
+        files = self._collect_local_files()
+        tree: List[Dict[str, Any]] = []
+        seen_dirs = set()
+
+        for file_info in files:
+            file_path = file_info['path']
+            path_obj = Path(file_path)
+
+            # Ensure parent directories are listed
+            for depth in range(1, len(path_obj.parts)):
+                dir_path = '/'.join(path_obj.parts[:depth])
+                if dir_path and dir_path not in seen_dirs:
+                    tree.append({'path': dir_path, 'type': 'dir', 'size': 0})
+                    seen_dirs.add(dir_path)
+
+            tree.append({
+                'path': file_path,
+                'type': 'file',
+                'size': file_info['size']
+            })
+
+        # Sort to keep deterministic ordering
+        tree.sort(key=lambda item: item['path'])
+        return tree
+
+    def _detect_local_languages(self) -> Dict[str, Dict[str, float]]:
+        files = self._collect_local_files()
+        language_totals: Dict[str, int] = {}
+
+        for file_info in files:
+            suffix = Path(file_info['path']).suffix.lower()
+            language = LOCAL_LANGUAGE_EXTENSIONS.get(suffix)
+            if not language:
+                continue
+            language_totals[language] = language_totals.get(language, 0) + file_info['size']
+
+        total_bytes = sum(language_totals.values())
+        if total_bytes == 0:
+            return {}
+
+        return {
+            lang: {
+                'bytes': bytes_count,
+                'percentage': round((bytes_count / total_bytes) * 100, 2)
+            }
+            for lang, bytes_count in language_totals.items()
+        }
+
+    def _check_dirty_worktree(self):
+        status_output = self._run_git_command(["status", "--porcelain"])
+        if not status_output:
+            return
+
+        lines = [line for line in status_output.splitlines() if line.strip()]
+        if not lines:
+            return
+
+        untracked = sum(1 for line in lines if line.startswith('??'))
+        modified = len(lines) - untracked
+
+        message = (
+            "⚠️ 本地仓库包含未提交或未跟踪的更改，当前结果仅基于工作树快照。"  # Current snapshot warning
+        )
+        if untracked and not self.include_untracked:
+            message += " 未跟踪文件将被忽略，可使用 --include-untracked 选项。"
+
+        if modified:
+            message += " 请确认已提交需要分析的更改。"
+
+        logger.warning(message)
+
+    def _detect_local_license(self) -> Optional[str]:
+        if not self._is_local_mode():
+            return None
+
+        candidates = [
+            'LICENSE', 'LICENSE.md', 'LICENSE.txt', 'COPYING',
+            'COPYING.md', 'COPYING.txt'
+        ]
+
+        for candidate in candidates:
+            path = self._resolve_local_path(candidate)
+            if path and path.is_file():
+                return path.name
+        return None
+
+    def _read_repo_file(self, relative_path: str) -> Optional[str]:
+        if self._is_local_mode():
+            return self._read_local_file(relative_path)
+
+        if not self.repo:
+            return None
+
+        try:
+            content = self.repo.get_contents(relative_path)
+            if not content:
+                return None
+
+            content_type = getattr(content, 'type', None)
+            if content_type == 'dir':
+                return None
+            return content.decoded_content.decode('utf-8')
+        except GithubException:
+            return None
+
         return None
 
     def scrape(self) -> Dict[str, Any]:
@@ -173,14 +451,27 @@ class GitHubScraper:
             raise
 
     def _fetch_repository(self):
+        if self._is_local_mode():
+            self._fetch_local_repository()
+        else:
+            self._fetch_remote_repository()
+
+    def _fetch_remote_repository(self):
         """C1.1: Fetch repository structure using GitHub API."""
         logger.info(f"Fetching repository: {self.repo_name}")
 
         try:
             self.repo = self.github.get_repo(self.repo_name)
 
-            # Extract basic repo info
-            self.extracted_data['repo_info'] = {
+            latest_commit = None
+            try:
+                branch_data = self.repo.get_branch(self.repo.default_branch)
+                if branch_data and branch_data.commit:
+                    latest_commit = branch_data.commit.sha
+            except GithubException:
+                latest_commit = None
+
+            repo_info = {
                 'name': self.repo.name,
                 'full_name': self.repo.full_name,
                 'description': self.repo.description,
@@ -194,7 +485,18 @@ class GitHubScraper:
                 'updated_at': self.repo.updated_at.isoformat() if self.repo.updated_at else None,
                 'language': self.repo.language,
                 'license': self.repo.license.name if self.repo.license else None,
-                'topics': self.repo.get_topics()
+                'topics': self.repo.get_topics(),
+                'latest_commit': latest_commit,
+                'source_type': self.source_type
+            }
+
+            self.extracted_data['repo_info'] = repo_info
+            self.extracted_data['source_type'] = self.source_type
+            self.extracted_data['source_metadata'] = {
+                'type': self.source_type,
+                'branch': self.repo.default_branch,
+                'head_commit': latest_commit,
+                'repository': self.repo.full_name
             }
 
             logger.info(f"Repository fetched: {self.repo.full_name} ({self.repo.stargazers_count} stars)")
@@ -203,6 +505,63 @@ class GitHubScraper:
             if e.status == 404:
                 raise ValueError(f"Repository not found: {self.repo_name}")
             raise
+
+    def _fetch_local_repository(self):
+        """Gather metadata directly from a local Git checkout."""
+        assert self.local_repo_root is not None
+
+        git_dir = self.local_repo_root / '.git'
+        if not git_dir.exists():
+            raise ValueError(f"目标目录不是有效的 Git 仓库：{self._local_repo_display}")
+
+        try:
+            head_commit = self._run_git_command(["rev-parse", "HEAD"])
+            branch = self._run_git_command(["rev-parse", "--abbrev-ref", "HEAD"])
+            created_at = self._run_git_command([
+                "log", "--reverse", "--format=%cI", "--max-count=1"
+            ]) or None
+            updated_at = self._run_git_command(["log", "-1", "--format=%cI"]) or None
+        except LocalGitError as exc:
+            raise ValueError(str(exc)) from exc
+
+        repo_info = {
+            'name': self.repo_name,
+            'full_name': self.repo_name,
+            'description': self.description,
+            'url': None,
+            'homepage': None,
+            'stars': 0,
+            'forks': 0,
+            'open_issues': 0,
+            'default_branch': branch,
+            'created_at': created_at,
+            'updated_at': updated_at,
+            'language': None,
+            'license': self._detect_local_license(),
+            'topics': [],
+            'latest_commit': head_commit,
+            'source_type': self.source_type
+        }
+
+        self.extracted_data['repo_info'] = repo_info
+        self.extracted_data['source_type'] = self.source_type
+        self.extracted_data['source_metadata'] = {
+            'type': self.source_type,
+            'path': self._local_repo_display,
+            'head_commit': head_commit,
+            'branch': branch
+        }
+
+        short_commit = head_commit[:7] if head_commit else 'unknown'
+        logger.info(
+            f"Using local GitHub snapshot at {self._local_repo_display} (branch: {branch}, commit: {short_commit})"
+        )
+
+        # Warn if working tree has pending changes
+        try:
+            self._check_dirty_worktree()
+        except LocalGitError as exc:
+            logger.warning(f"无法检查工作区状态：{exc}")
 
     def _extract_readme(self):
         """C1.2: Extract README.md files."""
@@ -213,14 +572,11 @@ class GitHubScraper:
                        'docs/README.md', '.github/README.md']
 
         for readme_path in readme_files:
-            try:
-                content = self.repo.get_contents(readme_path)
-                if content:
-                    self.extracted_data['readme'] = content.decoded_content.decode('utf-8')
-                    logger.info(f"README found: {readme_path}")
-                    return
-            except GithubException:
-                continue
+            content = self._read_repo_file(readme_path)
+            if content:
+                self.extracted_data['readme'] = content
+                logger.info(f"README found: {readme_path}")
+                return
 
         logger.warning("No README found in repository")
 
@@ -245,6 +601,15 @@ class GitHubScraper:
         """C1.4: Detect programming languages in repository."""
         logger.info("Detecting programming languages...")
 
+        if self._is_local_mode():
+            languages = self._detect_local_languages()
+            if languages:
+                self.extracted_data['languages'] = languages
+                logger.info(f"Languages detected: {', '.join(languages.keys())}")
+            else:
+                logger.warning("No languages detected in local repository")
+            return
+
         try:
             languages = self.repo.get_languages()
             total_bytes = sum(languages.values())
@@ -265,6 +630,12 @@ class GitHubScraper:
     def _extract_file_tree(self):
         """Extract repository file tree structure."""
         logger.info("Building file tree...")
+
+        if self._is_local_mode():
+            file_tree = self._build_local_file_tree()
+            self.extracted_data['file_tree'] = file_tree
+            logger.info(f"File tree built: {len(file_tree)} items")
+            return
 
         try:
             contents = self.repo.get_contents("")
@@ -351,8 +722,9 @@ class GitHubScraper:
 
             # Analyze this file
             try:
-                file_content = self.repo.get_contents(file_path)
-                content = file_content.decoded_content.decode('utf-8')
+                content = self._read_repo_file(file_path)
+                if not content:
+                    continue
 
                 analysis_result = self.code_analyzer.analyze_file(
                     file_path,
@@ -398,6 +770,11 @@ class GitHubScraper:
         """C1.7: Extract GitHub Issues (open/closed, labels, milestones)."""
         logger.info(f"Extracting GitHub Issues (max {self.max_issues})...")
 
+        if self._is_local_mode():
+            logger.info("Skipping GitHub issues in local mode (offline)")
+            self.extracted_data['issues'] = []
+            return
+
         try:
             # Fetch recent issues (open + closed)
             issues = self.repo.get_issues(state='all', sort='updated', direction='desc')
@@ -438,20 +815,22 @@ class GitHubScraper:
                           'docs/CHANGELOG.md', '.github/CHANGELOG.md']
 
         for changelog_path in changelog_files:
-            try:
-                content = self.repo.get_contents(changelog_path)
-                if content:
-                    self.extracted_data['changelog'] = content.decoded_content.decode('utf-8')
-                    logger.info(f"CHANGELOG found: {changelog_path}")
-                    return
-            except GithubException:
-                continue
+            content = self._read_repo_file(changelog_path)
+            if content:
+                self.extracted_data['changelog'] = content
+                logger.info(f"CHANGELOG found: {changelog_path}")
+                return
 
         logger.warning("No CHANGELOG found in repository")
 
     def _extract_releases(self):
         """C1.9: Extract GitHub Releases with version history."""
         logger.info("Extracting GitHub Releases...")
+
+        if self._is_local_mode():
+            logger.info("Skipping releases in local mode (GitHub API unavailable)")
+            self.extracted_data['releases'] = []
+            return
 
         try:
             releases = self.repo.get_releases()
@@ -751,6 +1130,10 @@ Examples:
     parser.add_argument('--no-releases', action='store_true', help='Skip releases')
     parser.add_argument('--max-issues', type=int, default=100, help='Max issues to fetch')
     parser.add_argument('--scrape-only', action='store_true', help='Only scrape, don\'t build skill')
+    parser.add_argument('--github-local-path', help='Path to a local Git repository to reuse GitHub mode without API access')
+    parser.add_argument('--github-repo-name', help='Override repository name when using --github-local-path')
+    parser.add_argument('--include-untracked', action='store_true', help='Include untracked files when analyzing local repositories')
+    parser.add_argument('--show-absolute-path', action='store_true', help='Show the absolute local path in logs (default hides it)')
 
     args = parser.parse_args()
 
@@ -758,19 +1141,43 @@ Examples:
     if args.config:
         with open(args.config, 'r') as f:
             config = json.load(f)
-    elif args.repo:
+
+        # Allow overrides for local mode when using config files
+        if args.github_local_path:
+            config['github_local_path'] = args.github_local_path
+        if args.github_repo_name:
+            config['github_repo_name'] = args.github_repo_name
+        if args.include_untracked:
+            config['include_untracked'] = True
+        if args.show_absolute_path:
+            config['show_absolute_path'] = True
+    else:
+        if not args.repo and not args.github_local_path:
+            parser.error('Either --repo, --github-local-path or --config is required')
+
+        repo_value = args.repo or args.github_repo_name
+        if not repo_value and args.github_local_path:
+            repo_value = Path(args.github_local_path).expanduser().resolve().name
+
+        repo_label = repo_value or 'local-repo'
+
         config = {
-            'repo': args.repo,
-            'name': args.name or args.repo.split('/')[-1],
-            'description': args.description or f'GitHub repository skill for {args.repo}',
+            'repo': repo_value or repo_label,
+            'name': args.name or (repo_label.split('/')[-1] if '/' in repo_label else repo_label),
+            'description': args.description or f'GitHub repository skill for {repo_label}',
             'github_token': args.token,
             'include_issues': not args.no_issues,
             'include_changelog': not args.no_changelog,
             'include_releases': not args.no_releases,
-            'max_issues': args.max_issues
+            'max_issues': args.max_issues,
+            'github_local_path': args.github_local_path,
+            'github_repo_name': args.github_repo_name,
+            'include_untracked': args.include_untracked,
+            'show_absolute_path': args.show_absolute_path
         }
-    else:
-        parser.error('Either --repo or --config is required')
+
+        # Drop None values to keep config clean
+        config = {k: v for k, v in config.items() if v is not None}
 
     try:
         # Phase 1: Scrape GitHub repository

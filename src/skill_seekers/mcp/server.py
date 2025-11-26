@@ -374,12 +374,30 @@ async def list_tools() -> list[Tool]:
                     },
                     "description": {
                         "type": "string",
-                        "description": "Skill description",
-                    },
-                    "token": {
-                        "type": "string",
-                        "description": "GitHub personal access token (or use GITHUB_TOKEN env var)",
-                    },
+                    "description": "Skill description",
+                },
+                "github_local_path": {
+                    "type": "string",
+                    "description": "Path to a local Git repository for offline GitHub analysis",
+                },
+                "github_repo_name": {
+                    "type": "string",
+                    "description": "Override repository name when using github_local_path",
+                },
+                "include_untracked": {
+                    "type": "boolean",
+                    "description": "Include untracked files when scanning a local repository",
+                    "default": False,
+                },
+                "show_absolute_path": {
+                    "type": "boolean",
+                    "description": "Show absolute local paths in MCP logs (default hides them)",
+                    "default": False,
+                },
+                "token": {
+                    "type": "string",
+                    "description": "GitHub personal access token (or use GITHUB_TOKEN env var)",
+                },
                     "no_issues": {
                         "type": "boolean",
                         "description": "Skip GitHub issues extraction (default: false)",
@@ -394,9 +412,9 @@ async def list_tools() -> list[Tool]:
                         "type": "boolean",
                         "description": "Skip releases extraction (default: false)",
                         "default": False,
-                    },
-                    "max_issues": {
-                        "type": "integer",
+                },
+                "max_issues": {
+                    "type": "integer",
                         "description": "Maximum issues to fetch (default: 100)",
                         "default": 100,
                     },
@@ -991,6 +1009,10 @@ async def scrape_github_tool(args: dict) -> list[TextContent]:
     name = args.get("name")
     description = args.get("description")
     token = args.get("token")
+    github_local_path = args.get("github_local_path")
+    github_repo_name = args.get("github_repo_name")
+    include_untracked = args.get("include_untracked", False)
+    show_absolute_path = args.get("show_absolute_path", False)
     no_issues = args.get("no_issues", False)
     no_changelog = args.get("no_changelog", False)
     no_releases = args.get("no_releases", False)
@@ -1004,9 +1026,12 @@ async def scrape_github_tool(args: dict) -> list[TextContent]:
     if config_path:
         cmd.extend(["--config", config_path])
 
-    # Mode 2: Direct repo
-    elif repo:
-        cmd.extend(["--repo", repo])
+    else:
+        if repo:
+            cmd.extend(["--repo", repo])
+        elif not github_local_path:
+            return [TextContent(type="text", text="❌ Error: Must specify --repo, --github-local-path, or --config")]
+
         if name:
             cmd.extend(["--name", name])
         if description:
@@ -1024,8 +1049,14 @@ async def scrape_github_tool(args: dict) -> list[TextContent]:
         if scrape_only:
             cmd.append("--scrape-only")
 
-    else:
-        return [TextContent(type="text", text="❌ Error: Must specify --repo or --config")]
+    if github_local_path:
+        cmd.extend(["--github-local-path", github_local_path])
+    if github_repo_name:
+        cmd.extend(["--github-repo-name", github_repo_name])
+    if include_untracked:
+        cmd.append("--include-untracked")
+    if show_absolute_path:
+        cmd.append("--show-absolute-path")
 
     # Run github_scraper.py with streaming (can take a while)
     timeout = 600  # 10 minutes for GitHub scraping
