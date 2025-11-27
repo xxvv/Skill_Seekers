@@ -7,13 +7,14 @@ Tests URL validation, language detection, pattern extraction, and categorization
 import sys
 import os
 import unittest
-from unittest.mock import Mock, MagicMock
+import logging
+from unittest.mock import Mock, MagicMock, patch
 from bs4 import BeautifulSoup
 
 # Add parent directory to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from skill_seekers.cli.doc_scraper import DocToSkillConverter
+from skill_seekers.cli.doc_scraper import DocToSkillConverter, ensure_pyppeteer_chromium
 
 
 class TestURLValidation(unittest.TestCase):
@@ -521,6 +522,129 @@ class TestTextCleaning(unittest.TestCase):
         text = "   Hello world   "
         cleaned = self.converter.clean_text(text)
         self.assertEqual(cleaned, "Hello world")
+
+
+class TestJsRenderingConfig(unittest.TestCase):
+    """Tests around optional JS rendering support."""
+
+    def _base_config(self):
+        return {
+            'name': 'spa',
+            'base_url': 'https://spa.example.com/',
+            'start_urls': ['https://spa.example.com/#/home'],
+            'selectors': {'main_content': 'article', 'title': 'h1', 'code_blocks': 'pre code'},
+            'rate_limit': 0,
+            'max_pages': 5,
+        }
+
+    def test_render_js_forces_sync_mode(self):
+        """render_js should disable async and workers>1."""
+        config = self._base_config()
+        config.update({'render_js': True, 'workers': 4, 'async_mode': True})
+
+        converter = DocToSkillConverter(config, dry_run=True)
+
+        self.assertTrue(converter.render_js_enabled)
+        self.assertEqual(converter.workers, 1)
+        self.assertFalse(converter.async_mode)
+
+    @patch('skill_seekers.cli.doc_scraper.JsRenderer')
+    def test_get_page_html_uses_renderer(self, mock_renderer_cls):
+        """_get_page_html delegates to JsRenderer when enabled."""
+        config = self._base_config()
+        config['render_js'] = {'enabled': True, 'wait_for': '.ready'}
+
+        renderer_instance = mock_renderer_cls.return_value
+        renderer_instance.render.return_value = '<html>Rendered</html>'
+
+        converter = DocToSkillConverter(config, dry_run=True)
+        html = converter._get_page_html('https://spa.example.com/#/detail-grid')
+
+        mock_renderer_cls.assert_called_once()
+        renderer_instance.render.assert_called_once_with('https://spa.example.com/#/detail-grid')
+        self.assertEqual(html, '<html>Rendered</html>')
+
+    @patch.dict(os.environ, {'SKILL_SEEKERS_BROWSER_PATH': r'C:\Portable\Chrome\chrome.exe'})
+    def test_render_js_env_browser_path(self):
+        """Env var should auto-populate executable path when render_js=True."""
+        config = self._base_config()
+        config['render_js'] = True
+
+        converter = DocToSkillConverter(config, dry_run=True)
+
+        expected = os.path.abspath(r'C:\Portable\Chrome\chrome.exe')
+        self.assertEqual(converter.render_js_config['executable_path'], expected)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_render_js_config_browser_executable(self):
+        """Config-provided browser_executable overrides env."""
+        config = self._base_config()
+        config['render_js'] = {
+            'enabled': True,
+            'browser_executable': r'D:\Apps\Chrome\chrome.exe',
+        }
+
+        converter = DocToSkillConverter(config, dry_run=True)
+
+        expected = os.path.abspath(r'D:\Apps\Chrome\chrome.exe')
+        self.assertEqual(converter.render_js_config['executable_path'], expected)
+
+
+class TestJsRenderingUtilities(unittest.TestCase):
+    """Tests around pyppeteer download utilities."""
+
+    def setUp(self):
+        self.logger = logging.getLogger('test_js_renderer_utils')
+
+    def test_ensure_pyppeteer_chromium_fallbacks_to_new_revision(self):
+        """When pyppeteer revision is missing, we fetch and apply a new one."""
+        mock_util = MagicMock()
+        mock_util.check_chromium.return_value = False
+        mock_util.download_chromium.side_effect = [
+            OSError('Chromium downloadable not found ... NoSuchKey ...'),
+            None,
+        ]
+
+        mock_downloader = MagicMock()
+
+        with patch('skill_seekers.cli.doc_scraper.pyppeteer_util', mock_util), \
+                patch('skill_seekers.cli.doc_scraper.chromium_downloader', mock_downloader), \
+                patch('skill_seekers.cli.doc_scraper._fetch_latest_chromium_revision', return_value='1550801') as mock_fetch, \
+                patch('skill_seekers.cli.doc_scraper._apply_chromium_revision') as mock_apply, \
+                patch('skill_seekers.cli.doc_scraper.launch', object()):
+            ensure_pyppeteer_chromium(self.logger)
+
+        self.assertEqual(mock_util.download_chromium.call_count, 2)
+        mock_fetch.assert_called_once_with()
+        mock_apply.assert_called_once_with('1550801')
+
+    def test_ensure_pyppeteer_chromium_re_raises_other_errors(self):
+        """Unexpected download errors should bubble up."""
+        mock_util = MagicMock()
+        mock_util.check_chromium.return_value = False
+        mock_util.download_chromium.side_effect = OSError('network timeout')
+
+        mock_downloader = MagicMock()
+
+        with patch('skill_seekers.cli.doc_scraper.pyppeteer_util', mock_util), \
+                patch('skill_seekers.cli.doc_scraper.chromium_downloader', mock_downloader), \
+                patch('skill_seekers.cli.doc_scraper.launch', object()):
+            with self.assertRaises(OSError):
+                ensure_pyppeteer_chromium(self.logger)
+
+    def test_ensure_pyppeteer_chromium_skips_when_already_installed(self):
+        """No download when Chromium already exists."""
+        mock_util = MagicMock()
+        mock_util.check_chromium.return_value = True
+
+        mock_downloader = MagicMock()
+
+        with patch('skill_seekers.cli.doc_scraper.pyppeteer_util', mock_util), \
+                patch('skill_seekers.cli.doc_scraper.chromium_downloader', mock_downloader), \
+                patch('skill_seekers.cli.doc_scraper.launch', object()):
+            ensure_pyppeteer_chromium(self.logger)
+
+        mock_util.download_chromium.assert_not_called()
 
 
 if __name__ == '__main__':

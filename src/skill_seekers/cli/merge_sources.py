@@ -16,7 +16,10 @@ import tempfile
 import os
 from pathlib import Path
 from typing import Dict, List, Any, Optional
-from .conflict_detector import Conflict, ConflictDetector
+try:
+    from .conflict_detector import Conflict, ConflictDetector
+except ImportError:
+    from conflict_detector import Conflict, ConflictDetector
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)

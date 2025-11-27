@@ -133,6 +133,7 @@ python3 cli/doc_scraper.py --config configs/react.json --async --workers 8
 - Scraping < 100 pages (overhead not worth it)
 - workers = 1 (no parallelism benefit)
 - Testing/debugging (sync is simpler)
+- `render_js` is enabled (SPA rendering uses a headless browser and forces sync mode automatically)
 
 ### Rate Limiting
 

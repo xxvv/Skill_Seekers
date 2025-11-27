@@ -20,7 +20,7 @@ Terminal Selection:
 
 import os
 import sys
-import time
+import locale
 import subprocess
 import tempfile
 from pathlib import Path
@@ -30,6 +30,42 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from skill_seekers.cli.constants import LOCAL_CONTENT_LIMIT, LOCAL_PREVIEW_LIMIT
 from skill_seekers.cli.utils import read_reference_files
+
+
+def _supports_unicode_output():
+    """Return True if the active stdout encoding can render Unicode glyphs."""
+    encoding = getattr(sys.stdout, "encoding", None) or locale.getpreferredencoding(False) or "utf-8"
+    try:
+        "✓".encode(encoding)
+        "⚠".encode(encoding)
+    except UnicodeEncodeError:
+        return False
+    except Exception:
+        return False
+    return True
+
+
+UNICODE_OUTPUT = _supports_unicode_output()
+
+
+def _icon(symbol: str, fallback: str) -> str:
+    """Return the symbol if Unicode is supported, otherwise the fallback string."""
+    return symbol if UNICODE_OUTPUT else fallback
+
+
+ICONS = {
+    "error": _icon("❌", "[ERROR]"),
+    "book": _icon("📖", "[INFO]"),
+    "memo": _icon("📝", "[INFO]"),
+    "check": _icon("✓", "[OK]"),
+    "success": _icon("✅", "[DONE]"),
+    "rocket": _icon("🚀", "[RUN]"),
+    "warning": _icon("⚠️", "[WARN]"),
+    "arrow": _icon("→", "->"),
+    "status": _icon("📊", "[STATUS]"),
+    "hourglass": _icon("⏳", "[WAIT]"),
+    "lightbulb": _icon("💡", "[TIP]"),
+}
 
 
 def detect_terminal_app():
@@ -98,7 +134,7 @@ class LocalSkillEnhancer:
         )
 
         if not references:
-            print("❌ No reference files found")
+            print(f"{ICONS['error']} No reference files found")
             return None
 
         # Read current SKILL.md
@@ -174,11 +210,11 @@ First, backup the original to: {self.skill_md_path.with_suffix('.md.backup').abs
 
         # Validate
         if not self.skill_dir.exists():
-            print(f"❌ Directory not found: {self.skill_dir}")
+            print(f"{ICONS['error']} Directory not found: {self.skill_dir}")
             return False
 
         # Read reference files
-        print("📖 Reading reference documentation...")
+        print(f"{ICONS['book']} Reading reference documentation...")
         references = read_reference_files(
             self.skill_dir,
             max_chars=LOCAL_CONTENT_LIMIT,
@@ -186,15 +222,15 @@ First, backup the original to: {self.skill_md_path.with_suffix('.md.backup').abs
         )
 
         if not references:
-            print("❌ No reference files found to analyze")
+            print(f"{ICONS['error']} No reference files found to analyze")
             return False
 
-        print(f"  ✓ Read {len(references)} reference files")
+        print(f"  {ICONS['check']} Read {len(references)} reference files")
         total_size = sum(len(c) for c in references.values())
-        print(f"  ✓ Total size: {total_size:,} characters\n")
+        print(f"  {ICONS['check']} Total size: {total_size:,} characters\n")
 
         # Create prompt
-        print("📝 Creating enhancement prompt...")
+        print(f"{ICONS['memo']} Creating enhancement prompt...")
         prompt = self.create_enhancement_prompt()
 
         if not prompt:
@@ -205,10 +241,10 @@ First, backup the original to: {self.skill_md_path.with_suffix('.md.backup').abs
             prompt_file = f.name
             f.write(prompt)
 
-        print(f"  ✓ Prompt saved ({len(prompt):,} characters)\n")
+        print(f"  {ICONS['check']} Prompt saved ({len(prompt):,} characters)\n")
 
         # Launch Claude Code in new terminal
-        print("🚀 Launching Claude Code in new terminal...")
+        print(f"{ICONS['rocket']} Launching Claude Code in new terminal...")
         print("   This will:")
         print("   1. Open a new terminal window")
         print("   2. Run Claude Code with the enhancement task")
@@ -217,10 +253,11 @@ First, backup the original to: {self.skill_md_path.with_suffix('.md.backup').abs
         print()
 
         # Create a shell script to run in the terminal
+        success_symbol = ICONS['success']
         shell_script = f'''#!/bin/bash
 claude {prompt_file}
 echo ""
-echo "✅ Enhancement complete!"
+echo "{success_symbol} Enhancement complete!"
 echo "Press any key to close..."
 read -n 1
 rm {prompt_file}
@@ -244,37 +281,37 @@ rm {prompt_file}
             elif detection_method == 'TERM_PROGRAM':
                 print(f"   Using terminal: {terminal_app} (inherited from current terminal)")
             elif detection_method.startswith('unknown TERM_PROGRAM'):
-                print(f"⚠️  {detection_method}")
-                print(f"   → Using Terminal.app as fallback")
+                print(f"{ICONS['warning']}  {detection_method}")
+                print(f"   {ICONS['arrow']} Using Terminal.app as fallback")
             else:
                 print(f"   Using terminal: {terminal_app} (default)")
 
             try:
                 subprocess.Popen(['open', '-a', terminal_app, script_file])
             except Exception as e:
-                print(f"⚠️  Error launching {terminal_app}: {e}")
+                print(f"{ICONS['warning']}  Error launching {terminal_app}: {e}")
                 print(f"\nManually run: {script_file}")
                 return False
         else:
-            print("⚠️  Auto-launch only works on macOS")
+            print(f"{ICONS['warning']}  Auto-launch only works on macOS")
             print(f"\nManually run this command in a new terminal:")
             print(f"  claude '{prompt_file}'")
             print(f"\nThen delete the prompt file:")
             print(f"  rm '{prompt_file}'")
             return False
 
-        print("✅ New terminal launched with Claude Code!")
+        print(f"{ICONS['success']} New terminal launched with Claude Code!")
         print()
-        print("📊 Status:")
+        print(f"{ICONS['status']} Status:")
         print(f"  - Prompt file: {prompt_file}")
         print(f"  - Skill directory: {self.skill_dir.absolute()}")
         print(f"  - SKILL.md will be saved to: {self.skill_md_path.absolute()}")
         print(f"  - Original backed up to: {self.skill_md_path.with_suffix('.md.backup').absolute()}")
         print()
-        print("⏳ Wait for Claude Code to finish in the other terminal...")
+        print(f"{ICONS['hourglass']} Wait for Claude Code to finish in the other terminal...")
         print("   (Usually takes 30-60 seconds)")
         print()
-        print("💡 When done:")
+        print(f"{ICONS['lightbulb']} When done:")
         print(f"  1. Check the enhanced SKILL.md: {self.skill_md_path}")
         print(f"  2. If you don't like it, restore: mv {self.skill_md_path.with_suffix('.md.backup')} {self.skill_md_path}")
         print(f"  3. Package: skill-seekers package {self.skill_dir}/")

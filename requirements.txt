@@ -23,6 +23,7 @@ pydantic_core==2.41.4
 PyGithub==2.5.0
 Pygments==2.19.2
 PyMuPDF==1.24.14
+pyppeteer==1.0.2
 Pillow==11.0.0
 pytesseract==0.3.13
 pytest==8.4.2

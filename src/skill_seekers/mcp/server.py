@@ -813,7 +813,10 @@ async def validate_config_tool(args: dict) -> list[TextContent]:
 
         # Try unified config validator first
         try:
-            from config_validator import validate_config
+            try:
+                from skill_seekers.cli.config_validator import validate_config
+            except ImportError:
+                from config_validator import validate_config
             validator = validate_config(config_path)
 
             result = f"✅ Config is valid!\n\n"

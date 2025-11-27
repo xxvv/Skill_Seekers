@@ -154,16 +154,28 @@ class ConfigValidator:
 
     def _validate_github_source(self, source: Dict[str, Any], index: int):
         """Validate GitHub source configuration."""
-        if 'repo' not in source:
-            raise ValueError(f"Source {index} (github): Missing required field 'repo'")
+        repo = source.get('repo')
+        local_path = source.get('github_local_path')
 
-        # Validate repo format (owner/repo)
-        repo = source['repo']
-        if '/' not in repo:
+        if not repo and not local_path:
             raise ValueError(
-                f"Source {index} (github): Invalid repo format '{repo}'. "
-                f"Must be 'owner/repo' (e.g., 'facebook/react')"
+                f"Source {index} (github): Must provide either 'repo' (owner/repo) "
+                f"or 'github_local_path'"
             )
+
+        # Validate repo format (owner/repo) unless we're in pure local mode
+        if repo:
+            if '/' not in repo:
+                if local_path:
+                    logger.info(
+                        f"Source {index} (github): Repo '{repo}' lacks owner/slug; "
+                        f"using local Git metadata instead"
+                    )
+                else:
+                    raise ValueError(
+                        f"Source {index} (github): Invalid repo format '{repo}'. "
+                        f"Must be 'owner/repo' (e.g., 'facebook/react')"
+                    )
 
         # Validate code_analysis_depth if specified
         if 'code_analysis_depth' in source:

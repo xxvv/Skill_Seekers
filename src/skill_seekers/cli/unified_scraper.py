@@ -23,14 +23,21 @@ from typing import Dict, List, Any, Optional
 
 # Import validators and scrapers
 try:
-    from config_validator import ConfigValidator, validate_config
-    from conflict_detector import ConflictDetector
-    from merge_sources import RuleBasedMerger, ClaudeEnhancedMerger
-    from unified_skill_builder import UnifiedSkillBuilder
-except ImportError as e:
-    print(f"Error importing modules: {e}")
-    print("Make sure you're running from the project root directory")
-    sys.exit(1)
+    from .config_validator import ConfigValidator, validate_config
+    from .conflict_detector import ConflictDetector
+    from .merge_sources import RuleBasedMerger, ClaudeEnhancedMerger
+    from .unified_skill_builder import UnifiedSkillBuilder
+except ImportError:
+    # Fall back to direct imports when executed as a stand-alone script
+    try:
+        from config_validator import ConfigValidator, validate_config
+        from conflict_detector import ConflictDetector
+        from merge_sources import RuleBasedMerger, ClaudeEnhancedMerger
+        from unified_skill_builder import UnifiedSkillBuilder
+    except ImportError as e:
+        print(f"Error importing modules: {e}")
+        print("Make sure you're running from the project root directory or use 'python -m skill_seekers.cli.unified_scraper'")
+        sys.exit(1)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -119,23 +126,34 @@ class UnifiedScraper:
     def _scrape_documentation(self, source: Dict[str, Any]):
         """Scrape documentation website."""
         # Create temporary config for doc scraper
-        doc_config = {
-            'name': f"{self.name}_docs",
-            'base_url': source['base_url'],
-            'selectors': source.get('selectors', {}),
-            'url_patterns': source.get('url_patterns', {}),
-            'categories': source.get('categories', {}),
-            'rate_limit': source.get('rate_limit', 0.5),
-            'max_pages': source.get('max_pages', 100)
-        }
+        doc_config = {k: v for k, v in source.items() if k != 'type'}
+        doc_config['name'] = f"{self.name}_docs"
+
+        base_url = doc_config.get('base_url')
+        if not base_url:
+            raise ValueError("Documentation source requires 'base_url'")
+
+        doc_config['base_url'] = base_url
+        if not doc_config.get('description'):
+            doc_config['description'] = self.config.get('description', self.name)
+
+        start_urls = doc_config.get('start_urls')
+        if not start_urls:
+            doc_config['start_urls'] = [base_url]
+
+        doc_config.setdefault('selectors', {})
+        doc_config.setdefault('url_patterns', {})
+        doc_config.setdefault('categories', {})
+        doc_config.setdefault('rate_limit', 0.5)
+        doc_config.setdefault('max_pages', 100)
 
         # Write temporary config
         temp_config_path = os.path.join(self.data_dir, 'temp_docs_config.json')
-        with open(temp_config_path, 'w') as f:
-            json.dump(doc_config, f, indent=2)
+        with open(temp_config_path, 'w', encoding='utf-8') as f:
+            json.dump(doc_config, f, indent=2, ensure_ascii=False)
 
         # Run doc_scraper as subprocess
-        logger.info(f"Scraping documentation from {source['base_url']}")
+        logger.info(f"Scraping documentation from {doc_config['base_url']}")
 
         doc_scraper_path = Path(__file__).parent / "doc_scraper.py"
         cmd = [sys.executable, str(doc_scraper_path), '--config', temp_config_path]
@@ -176,9 +194,15 @@ class UnifiedScraper:
             logger.error("github_scraper.py not found")
             return
 
-        # Create config for GitHub scraper
+        # Determine repo identifier (supports local-only configs)
+        repo_value = source.get('repo') or source.get('github_repo_name')
+        if not repo_value and source.get('github_local_path'):
+            repo_value = Path(source['github_local_path']).expanduser().resolve().name
+        if not repo_value:
+            raise ValueError("GitHub source requires 'repo' or 'github_local_path'")
+
         github_config = {
-            'repo': source['repo'],
+            'repo': repo_value,
             'name': f"{self.name}_github",
             'github_token': source.get('github_token'),
             'include_issues': source.get('include_issues', True),
@@ -200,7 +224,7 @@ class UnifiedScraper:
             github_config['show_absolute_path'] = source['show_absolute_path']
 
         # Scrape
-        logger.info(f"Scraping GitHub repository: {source['repo']}")
+        logger.info(f"Scraping GitHub repository: {repo_value}")
         scraper = GitHubScraper(github_config)
         github_data = scraper.scrape()
 

@@ -923,9 +923,30 @@ skill-seekers scrape --config configs/myframework.json
     "api": ["api", "reference"]
   },
   "rate_limit": 0.5,
-  "max_pages": 500
+  "max_pages": 500,
+  "render_js": {
+    "enabled": true,
+    "wait_for": ".van-doc-content",
+    "wait_after": 0.5,
+    "timeout": 30,
+    "browser_executable": "C:/Program Files/Google/Chrome/Application/chrome.exe"
+  }
 }
 ```
+
+### Scraping Single Page Apps (SPA)
+
+Some documentation sites ship only a blank HTML shell and render everything with JavaScript (Vue, React, etc.).  
+Set the `render_js` block to tell Skill Seekers to spin up a headless Chromium instance (via **pyppeteer**) so the DOM is rendered before extraction.
+
+- `enabled` – turn JS rendering on/off.
+- `wait_for` – optional CSS selector Skill Seekers should wait for before reading the DOM (e.g., `.van-doc-content`).
+- `wait_after` – extra seconds to sleep after the selector appears (useful when content streams in).
+- `timeout` – max seconds to wait for the initial navigation.
+- `browser_executable` – optional absolute path to an existing Chrome/Chromium binary (skip pyppeteer downloads). You can also set the `SKILL_SEEKERS_BROWSER_PATH` environment variable to apply this globally.
+- `wait_until` / `selector_timeout` / `browser_args` – advanced tuning knobs when the defaults don’t work.
+
+> ⚠️ JS rendering forces synchronous, single-threaded scraping (async mode/workers are disabled automatically) and requires installing the `pyppeteer` dependency on first use.
 
 ## 📊 What Gets Created
 

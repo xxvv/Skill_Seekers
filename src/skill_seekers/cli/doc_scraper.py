@@ -18,6 +18,7 @@ import argparse
 import hashlib
 import logging
 import asyncio
+import threading
 import requests
 import httpx
 from pathlib import Path
@@ -25,6 +26,19 @@ from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
 from collections import deque, defaultdict
 from typing import Optional, Dict, List, Tuple, Set, Deque, Any
+
+try:
+    import pyppeteer
+    from pyppeteer import launch
+    from pyppeteer.errors import TimeoutError as PyppeteerTimeoutError
+    from pyppeteer import util as pyppeteer_util
+    from pyppeteer import chromium_downloader
+except ImportError:  # pragma: no cover - optional dependency for SPA rendering
+    pyppeteer = None
+    launch = None
+    pyppeteer_util = None
+    chromium_downloader = None
+    PyppeteerTimeoutError = Exception
 
 # Add parent directory to path for imports when run as script
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -44,6 +58,21 @@ from skill_seekers.cli.constants import (
 
 # Configure logging
 logger = logging.getLogger(__name__)
+
+PYPPETEER_SNAPSHOT_PATHS = {
+    'linux': 'Linux_x64',
+    'mac': 'Mac',
+    'win32': 'Win',
+    'win64': 'Win_x64',
+}
+
+PYPPETEER_MISSING_KEY_MARKERS = (
+    'NoSuchKey',
+    'No such object',
+    'Specified key does not exist',
+)
+
+BROWSER_PATH_ENV_VAR = 'SKILL_SEEKERS_BROWSER_PATH'
 
 
 def setup_logging(verbose: bool = False, quiet: bool = False) -> None:
@@ -65,6 +94,215 @@ def setup_logging(verbose: bool = False, quiet: bool = False) -> None:
         format='%(message)s',
         force=True
     )
+
+
+def _normalize_browser_path(raw_path: Optional[str]) -> Optional[str]:
+    """Expand user/env vars and return absolute path for a browser executable."""
+    if not raw_path:
+        return None
+
+    expanded = os.path.expandvars(os.path.expanduser(raw_path))
+    return os.path.abspath(expanded)
+
+
+def _should_retry_chromium_download(error: Exception) -> bool:
+    """Return True when the raised error indicates a missing snapshot."""
+    message = str(error)
+    return any(marker in message for marker in PYPPETEER_MISSING_KEY_MARKERS)
+
+
+def _fetch_latest_chromium_revision() -> str:
+    """Fetch the newest Chromium revision for the current platform."""
+    if chromium_downloader is None:
+        raise RuntimeError('pyppeteer is not available')
+
+    platform_key = chromium_downloader.current_platform()
+    snapshot_dir = PYPPETEER_SNAPSHOT_PATHS.get(platform_key)
+    if not snapshot_dir:
+        raise RuntimeError(f'Unsupported platform for Chromium snapshots: {platform_key}')
+
+    last_change_url = f"{chromium_downloader.BASE_URL}/{snapshot_dir}/LAST_CHANGE"
+    response = requests.get(last_change_url, timeout=15)
+    response.raise_for_status()
+    revision = response.text.strip()
+
+    if not revision:
+        raise RuntimeError('Received empty Chromium revision from snapshot service')
+
+    return revision
+
+
+def _apply_chromium_revision(revision: str) -> None:
+    """Patch pyppeteer globals to point at the provided revision."""
+    if chromium_downloader is None:
+        return
+
+    base_url = chromium_downloader.BASE_URL
+    windows_archive = chromium_downloader.windowsArchive
+
+    chromium_downloader.REVISION = revision
+    chromium_downloader.downloadURLs = {
+        'linux': f'{base_url}/Linux_x64/{revision}/chrome-linux.zip',
+        'mac': f'{base_url}/Mac/{revision}/chrome-mac.zip',
+        'win32': f'{base_url}/Win/{revision}/{windows_archive}.zip',
+        'win64': f'{base_url}/Win_x64/{revision}/{windows_archive}.zip',
+    }
+    chromium_downloader.chromiumExecutable = {
+        'linux': chromium_downloader.DOWNLOADS_FOLDER / revision / 'chrome-linux' / 'chrome',
+        'mac': (
+            chromium_downloader.DOWNLOADS_FOLDER / revision / 'chrome-mac' / 'Chromium.app' / 'Contents' / 'MacOS' / 'Chromium'
+        ),
+        'win32': chromium_downloader.DOWNLOADS_FOLDER / revision / windows_archive / 'chrome.exe',
+        'win64': chromium_downloader.DOWNLOADS_FOLDER / revision / windows_archive / 'chrome.exe',
+    }
+
+    if pyppeteer is not None:
+        pyppeteer.__chromium_revision__ = revision  # type: ignore[attr-defined]
+
+    os.environ['PYPPETEER_CHROMIUM_REVISION'] = revision
+
+
+def ensure_pyppeteer_chromium(logger: logging.Logger) -> None:
+    """Ensure a downloadable Chromium build exists for pyppeteer."""
+    if launch is None or pyppeteer_util is None or chromium_downloader is None:
+        return
+
+    if pyppeteer_util.check_chromium():
+        return
+
+    try:
+        pyppeteer_util.download_chromium()
+        return
+    except OSError as exc:
+        if not _should_retry_chromium_download(exc):
+            raise
+
+        revision = _fetch_latest_chromium_revision()
+        _apply_chromium_revision(revision)
+        logger.info('Retrying Chromium download with revision %s', revision)
+        pyppeteer_util.download_chromium()
+
+
+class JsRenderer:
+    """Lightweight wrapper around pyppeteer for optional SPA rendering."""
+
+    def __init__(self, config: Dict[str, Any], logger: logging.Logger):
+        if launch is None:
+            raise RuntimeError(
+                "JavaScript rendering requires the 'pyppeteer' dependency. "
+                "Install Skill Seekers with SPA support: pip install pyppeteer"
+            )
+
+        self.config = config
+        self.logger = logger
+        self.browser_executable = self._resolve_browser_executable()
+        if not self.browser_executable:
+            ensure_pyppeteer_chromium(self.logger)
+        self.loop = asyncio.new_event_loop()
+        self.browser = None
+        self._closed = False
+        self._ready = threading.Event()
+        self.thread = threading.Thread(
+            target=self._run_loop,
+            name="skill_seekers_js_renderer",
+            daemon=True
+        )
+        self.thread.start()
+        self._ready.wait()
+        self.browser = self._run_coroutine(self._launch_browser())
+
+    def _run_loop(self) -> None:
+        asyncio.set_event_loop(self.loop)
+        self._ready.set()
+        self.loop.run_forever()
+
+    def _run_coroutine(self, coro):
+        if self._closed:
+            raise RuntimeError("JS renderer has been shut down")
+        future = asyncio.run_coroutine_threadsafe(coro, self.loop)
+        return future.result()
+
+    async def _launch_browser(self):
+        args = self.config.get('browser_args', [])
+        launch_kwargs = dict(
+            headless=True,
+            args=args,
+            handleSIGINT=False,
+            handleSIGTERM=False,
+            handleSIGHUP=False,
+        )
+        if self.browser_executable:
+            launch_kwargs['executablePath'] = self.browser_executable
+        return await launch(**launch_kwargs)
+
+    def _resolve_browser_executable(self) -> Optional[str]:
+        path = self.config.get('executable_path')
+        if not path:
+            return None
+
+        normalized = _normalize_browser_path(path)
+        if not os.path.exists(normalized):
+            raise RuntimeError(
+                f"render_js.executable_path does not exist: {normalized}. "
+                f"Set a valid path or remove the option to let pyppeteer download Chromium."
+            )
+        return normalized
+
+    async def _render_page(self, url: str) -> str:
+        page = await self.browser.newPage()
+        await page.setUserAgent(self.config['user_agent'])
+
+        extra_headers = self.config.get('extra_headers')
+        if extra_headers:
+            await page.setExtraHTTPHeaders(extra_headers)
+
+        await page.goto(
+            url,
+            waitUntil=self.config['wait_until'],
+            timeout=int(self.config['timeout'] * 1000),
+        )
+
+        selector = self.config.get('wait_for_selector')
+        if selector:
+            try:
+                await page.waitForSelector(
+                    selector,
+                    timeout=int(self.config['selector_timeout'] * 1000),
+                )
+            except PyppeteerTimeoutError:
+                self.logger.warning(
+                    "  ⚠️  JS render: selector '%s' not found before timeout (%ss)",
+                    selector,
+                    self.config['selector_timeout'],
+                )
+
+        wait_after = self.config.get('wait_after_load', 0)
+        if wait_after:
+            await asyncio.sleep(wait_after)
+
+        content = await page.content()
+        await page.close()
+        return content
+
+    def render(self, url: str) -> str:
+        """Return fully rendered HTML for a URL."""
+        return self._run_coroutine(self._render_page(url))
+
+    def close(self) -> None:
+        """Tear down the browser and event loop."""
+        if self._closed:
+            return
+
+        try:
+            if self.browser:
+                self._run_coroutine(self.browser.close())
+        except Exception as exc:  # pragma: no cover - best effort logging
+            self.logger.debug("JS renderer close error: %s", exc)
+
+        self.loop.call_soon_threadsafe(self.loop.stop)
+        self.thread.join(timeout=5)
+        self.loop.close()
+        self._closed = True
 
 
 class DocToSkillConverter:
@@ -93,6 +331,21 @@ class DocToSkillConverter:
         # Parallel scraping config
         self.workers = config.get('workers', 1)
         self.async_mode = config.get('async_mode', DEFAULT_ASYNC_MODE)
+        self.user_agent = config.get('user_agent', 'Mozilla/5.0 (Documentation Scraper)')
+        self.default_headers = {'User-Agent': self.user_agent}
+
+        # SPA rendering support
+        self.render_js_config = self._parse_render_js_config(config.get('render_js'))
+        self.render_js_enabled = self.render_js_config['enabled']
+        self._js_renderer: Optional[JsRenderer] = None
+
+        if self.render_js_enabled:
+            if self.async_mode:
+                logger.warning("render_js enabled: forcing async_mode=False (JS rendering is sync-only)")
+                self.async_mode = False
+            if self.workers > 1:
+                logger.warning("render_js enabled: forcing workers=1 (JS rendering is single-threaded)")
+                self.workers = 1
 
         # State
         self.visited_urls: set[str] = set()
@@ -118,6 +371,72 @@ class DocToSkillConverter:
         if resume and not dry_run:
             self.load_checkpoint()
     
+    def _parse_render_js_config(self, raw_config: Any) -> Dict[str, Any]:
+        """Normalize render_js config block."""
+        env_browser_path = _normalize_browser_path(os.environ.get(BROWSER_PATH_ENV_VAR))
+        defaults = {
+            'enabled': False,
+            'wait_until': 'networkidle2',
+            'wait_for_selector': None,
+            'selector_timeout': 15.0,
+            'wait_after_load': 0.0,
+            'timeout': 30.0,
+            'user_agent': getattr(self, 'user_agent', 'Mozilla/5.0 (Documentation Scraper)'),
+            'browser_args': ['--no-sandbox', '--disable-setuid-sandbox', '--disable-gpu'],
+            'extra_headers': None,
+            'executable_path': env_browser_path,
+        }
+
+        if not raw_config:
+            return defaults
+
+        if isinstance(raw_config, bool):
+            config = defaults.copy()
+            config['browser_args'] = list(defaults['browser_args'])
+            config['enabled'] = raw_config
+            return config
+
+        if isinstance(raw_config, dict):
+            config = defaults.copy()
+            config['browser_args'] = list(defaults['browser_args'])
+            config['enabled'] = raw_config.get('enabled', True)
+            config['wait_until'] = raw_config.get('wait_until', config['wait_until'])
+
+            wait_for = raw_config.get('wait_for_selector') or raw_config.get('wait_for')
+            if wait_for:
+                config['wait_for_selector'] = wait_for
+
+            selector_timeout = raw_config.get('selector_timeout', raw_config.get('wait_for_timeout'))
+            if selector_timeout is not None:
+                config['selector_timeout'] = float(selector_timeout)
+
+            wait_after = raw_config.get('wait_after_load', raw_config.get('wait_after'))
+            if wait_after is not None:
+                config['wait_after_load'] = float(wait_after)
+
+            if 'timeout' in raw_config:
+                config['timeout'] = float(raw_config['timeout'])
+
+            if 'browser_args' in raw_config and isinstance(raw_config['browser_args'], list):
+                config['browser_args'] = [str(arg) for arg in raw_config['browser_args']]
+
+            extra_headers = raw_config.get('extra_headers')
+            if isinstance(extra_headers, dict):
+                config['extra_headers'] = {str(k): str(v) for k, v in extra_headers.items()}
+
+            manual_executable = (
+                raw_config.get('browser_executable')
+                or raw_config.get('browser_path')
+                or raw_config.get('executable_path')
+            )
+            if manual_executable:
+                config['executable_path'] = _normalize_browser_path(str(manual_executable))
+
+            return config
+
+        logger.warning("render_js config must be a boolean or object; ignoring invalid value")
+        return defaults
+    
     def is_valid_url(self, url: str) -> bool:
         """Check if URL should be scraped based on patterns.
 
@@ -141,6 +460,27 @@ class DocToSkillConverter:
             return False
 
         return True
+
+    def _ensure_js_renderer(self) -> None:
+        if not self.render_js_enabled:
+            return
+
+        if self._js_renderer is None:
+            self._js_renderer = JsRenderer(self.render_js_config, logger)
+
+    def _shutdown_js_renderer(self) -> None:
+        if self._js_renderer:
+            self._js_renderer.close()
+            self._js_renderer = None
+
+    def _get_page_html(self, url: str) -> str:
+        if self.render_js_enabled:
+            self._ensure_js_renderer()
+            return self._js_renderer.render(url)
+
+        response = requests.get(url, headers=self.default_headers, timeout=30)
+        response.raise_for_status()
+        return response.text
 
     def save_checkpoint(self) -> None:
         """Save progress checkpoint"""
@@ -394,11 +734,8 @@ class DocToSkillConverter:
         """
         try:
             # Scraping part (no lock needed - independent)
-            headers = {'User-Agent': 'Mozilla/5.0 (Documentation Scraper)'}
-            response = requests.get(url, headers=headers, timeout=30)
-            response.raise_for_status()
-
-            soup = BeautifulSoup(response.content, 'html.parser')
+            html = self._get_page_html(url)
+            soup = BeautifulSoup(html, 'html.parser')
             page = self.extract_content(soup, url)
 
             # Thread-safe operations (lock required)
@@ -447,10 +784,13 @@ class DocToSkillConverter:
         Note:
             Uses asyncio.Lock for async-safe operations instead of threading.Lock
         """
+        if self.render_js_enabled:
+            raise RuntimeError("render_js is not supported in async scraping mode")
+
         async with semaphore:  # Limit concurrent requests
             try:
                 # Async HTTP request
-                headers = {'User-Agent': 'Mozilla/5.0 (Documentation Scraper)'}
+                headers = self.default_headers.copy()
                 response = await client.get(url, headers=headers, timeout=30.0)
                 response.raise_for_status()
 
@@ -615,14 +955,27 @@ class DocToSkillConverter:
         """
         # Route to async version if enabled
         if self.async_mode:
-            asyncio.run(self.scrape_all_async())
+            try:
+                asyncio.run(self.scrape_all_async())
+            finally:
+                self._shutdown_js_renderer()
             return
 
+        try:
+            self._scrape_all_sync()
+        finally:
+            self._shutdown_js_renderer()
+
+    def _scrape_all_sync(self) -> None:
+        """Synchronous scraping path (supports JS rendering).
+
+        Handles llms.txt detection and the standard HTML scraping pipeline.
+        """
         # Try llms.txt first (unless dry-run)
         if not self.dry_run:
             llms_result = self._try_llms_txt()
             if llms_result:
-                logger.info("\n✅ Used llms.txt (%s) - skipping HTML scraping", self.llms_txt_variant)
+                logger.info("\n? Used llms.txt (%s) - skipping HTML scraping", self.llms_txt_variant)
                 self.save_summary()
                 return
 
@@ -634,6 +987,12 @@ class DocToSkillConverter:
             logger.info("SCRAPING: %s", self.name)
         logger.info("=" * 60)
         logger.info("Base URL: %s", self.base_url)
+
+        if self.render_js_enabled:
+            logger.info("JS rendering: enabled (wait_until=%s)", self.render_js_config['wait_until'])
+            selector = self.render_js_config.get('wait_for_selector')
+            if selector:
+                logger.info("   Wait for selector: %s", selector)
 
         if self.dry_run:
             logger.info("Mode: Preview only (no actual scraping)\n")
@@ -647,7 +1006,7 @@ class DocToSkillConverter:
 
         # Handle unlimited mode
         if max_pages is None or max_pages == -1:
-            logger.warning("⚠️  UNLIMITED MODE: No page limit (will scrape all pages)\n")
+            logger.warning("??  UNLIMITED MODE: No page limit (will scrape all pages)\n")
             unlimited = True
         else:
             unlimited = False
@@ -669,9 +1028,8 @@ class DocToSkillConverter:
                     # Just show what would be scraped
                     logger.info("  [Preview] %s", url)
                     try:
-                        headers = {'User-Agent': 'Mozilla/5.0 (Documentation Scraper - Dry Run)'}
-                        response = requests.get(url, headers=headers, timeout=10)
-                        soup = BeautifulSoup(response.content, 'html.parser')
+                        html = self._get_page_html(url)
+                        soup = BeautifulSoup(html, 'html.parser')
 
                         main_selector = self.config.get('selectors', {}).get('main_content', 'div[role="main"]')
                         main = soup.select_one(main_selector)
@@ -683,7 +1041,7 @@ class DocToSkillConverter:
                                     self.pending_urls.append(href)
                     except Exception as e:
                         # Failed to extract links in fast mode, continue anyway
-                        logger.warning("⚠️  Warning: Could not extract links from %s: %s", url, e)
+                        logger.warning("??  Warning: Could not extract links from %s: %s", url, e)
                 else:
                     self.scrape_page(url)
                     self.pages_scraped += 1
@@ -698,7 +1056,7 @@ class DocToSkillConverter:
         else:
             from concurrent.futures import ThreadPoolExecutor, as_completed
 
-            logger.info("🚀 Starting parallel scraping with %d workers\n", self.workers)
+            logger.info("?? Starting parallel scraping with %d workers\n", self.workers)
 
             with ThreadPoolExecutor(max_workers=self.workers) as executor:
                 futures = []
@@ -732,7 +1090,7 @@ class DocToSkillConverter:
                             future.result()  # Raises exception if scrape_page failed
                         except Exception as e:
                             with self.lock:
-                                logger.warning("  ⚠️  Worker exception: %s", e)
+                                logger.warning("  ??  Worker exception: %s", e)
 
                         completed += 1
 
@@ -745,28 +1103,16 @@ class DocToSkillConverter:
                             if self.pages_scraped % 10 == 0:
                                 logger.info("  [%d pages scraped]", self.pages_scraped)
 
-                    # Remove completed futures
-                    futures = [f for f in futures if not f.done()]
-
-                # Wait for remaining futures
-                for future in as_completed(futures):
-                    # Check for exceptions
-                    try:
-                        future.result()
-                    except Exception as e:
-                        with self.lock:
-                            logger.warning("  ⚠️  Worker exception: %s", e)
-
-                    with self.lock:
-                        self.pages_scraped += 1
+                        # Remove completed futures
+                        futures = [f for f in futures if not f.done()]
 
         if self.dry_run:
-            logger.info("\n✅ Dry run complete: would scrape ~%d pages", len(self.visited_urls))
+            logger.info("\n? Dry run complete: would scrape ~%d pages", len(self.visited_urls))
             if len(self.visited_urls) >= preview_limit:
                 logger.info("   (showing first %d, actual scraping may find more)", preview_limit)
-            logger.info("\n💡 To actually scrape, run without --dry-run")
+            logger.info("\n?? To actually scrape, run without --dry-run")
         else:
-            logger.info("\n✅ Scraped %d pages", len(self.visited_urls))
+            logger.info("\n? Scraped %d pages", len(self.visited_urls))
             self.save_summary()
 
     async def scrape_all_async(self) -> None:
@@ -778,6 +1124,9 @@ class DocToSkillConverter:
 
         Performance: ~2-3x faster than sync mode with same worker count.
         """
+        if self.render_js_enabled:
+            raise RuntimeError("render_js is not supported with async scraping")
+
         # Try llms.txt first (unless dry-run)
         if not self.dry_run:
             llms_result = self._try_llms_txt()
@@ -1357,7 +1706,7 @@ def load_config(config_path: str) -> Dict[str, Any]:
         'react'
     """
     try:
-        with open(config_path, 'r') as f:
+        with open(config_path, 'r', encoding='utf-8') as f:
             config = json.load(f)
     except json.JSONDecodeError as e:
         logger.error("❌ Error: Invalid JSON in config file: %s", config_path)

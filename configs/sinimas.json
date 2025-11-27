@@ -1,0 +1,53 @@
+{
+  "name": "sinimas",
+  "description": "根据vue2开发的的vant库扩展封装的组件",
+  "base_url": "http://192.168.21.121:31601/sinimas/",
+  "start_urls": [
+    "http://192.168.21.121:31601/sinimas/",
+    "http://192.168.21.121:31601/sinimas/#/home",
+    "http://192.168.21.121:31601/sinimas/#/create",
+    "http://192.168.21.121:31601/sinimas/#/changelog",
+    "http://192.168.21.121:31601/sinimas/#/standard",
+    "http://192.168.21.121:31601/sinimas/#/quickstart",
+    "http://192.168.21.121:31601/sinimas/#/theme",
+    "http://192.168.21.121:31601/sinimas/#/question",
+    "http://192.168.21.121:31601/sinimas/#/adapt",
+    "http://192.168.21.121:31601/sinimas/#/card",
+    "http://192.168.21.121:31601/sinimas/#/nav",
+    "http://192.168.21.121:31601/sinimas/#/detail-grid",
+    "http://192.168.21.121:31601/sinimas/#/scroll",
+    "http://192.168.21.121:31601/sinimas/#/pick",
+    "http://192.168.21.121:31601/sinimas/#/page",
+    "http://192.168.21.121:31601/sinimas/#/filter",
+    "http://192.168.21.121:31601/sinimas/#/list-page",
+    "http://192.168.21.121:31601/sinimas/#/echarts",
+    "http://192.168.21.121:31601/sinimas/#/http",
+    "http://192.168.21.121:31601/sinimas/#/native",
+    "http://192.168.21.121:31601/sinimas/#/rule",
+    "http://192.168.21.121:31601/sinimas/#/keep",
+    "http://192.168.21.121:31601/sinimas/#/format",
+    "http://192.168.21.121:31601/sinimas/#/qywx-oauth",
+    "http://192.168.21.121:31601/sinimas/#/dingtalk-oauth"
+  ],
+  "selectors": {
+    "main_content": ".van-doc-content",
+    "title": ".van-doc-content h1",
+    "code_blocks": ".van-doc-content pre code,.van-doc-content table"
+  },
+  "url_patterns": {
+    "include": ["/"]
+  },
+  "categories": {
+    "getting_started": ["代码规范", "代码提交规范"],
+    "components": ["代码演示", "API"]
+  },
+  "rate_limit": 0.5,
+  "max_pages": 200,
+  "render_js": {
+    "enabled": true,
+    "wait_for": ".van-doc-content",
+    "wait_after": 0.5,
+    "timeout": 30,
+    "browser_executable": "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
+  }
+}
